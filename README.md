@@ -161,7 +161,7 @@ python -m pytest test_tool_station.py -v
 ## 预约排队流程
 
 1. **创建预约**：对 `available`、`borrowed`、`overdue`、`reserved` 状态的工具均可创建预约，按先来先到排队
-2. **归还触发兑现**：工具归还后，若变为 `available` 且有等待中的预约，自动将第一位预约人标记为 `fulfilled`，工具进入 `reserved` 状态，设置 `reserved_for` 和 `retained_until`
+2. **归还触发兑现**：工具归还（含普通归还、逾期归还）后若有等待中的预约，自动将第一位预约人标记为 `fulfilled`，工具进入 `reserved` 状态，设置 `reserved_for` 和 `retained_until`；若无等待预约，普通归还回到 `available`，逾期归还回到 `overdue_returned`。损坏归还进入 `damaged`，不触发兑现
 3. **保留期借出**：在 `reserved` 状态下仅 `reserved_for` 指定的操作员可借出；其他人尝试借出会被 `tool_reserved` 错误拦截
 4. **保留期超时**：若保留期到期预约人未借出，预约自动标记为 `expired`，系统自动流转到下一位预约人或回到 `available`
 5. **取消补位**：取消已兑现的预约后，自动触发下一位预约人进入保留期
@@ -170,7 +170,7 @@ python -m pytest test_tool_station.py -v
 
 ### 同一操作员不可重复占位
 
-同一操作员对同一工具只能有一条 `waiting` 状态的预约，重复预约返回 `duplicate_reservation` 错误。
+同一操作员对同一工具只要存在**未完成预约**（即 `waiting` 或 `fulfilled` 状态），就不能再次创建预约，重复预约返回 `duplicate_reservation` 错误并在响应中给出 `existing_status` 说明已存在的预约处于什么状态。此规则同时覆盖"在等待队列中"和"当前正处于保留期"两种场景。
 
 ### 管理员代约
 

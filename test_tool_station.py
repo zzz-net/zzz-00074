@@ -967,3 +967,177 @@ class TestReserveOnAvailableTool:
         })
         tool = requests.get(f"{BASE}/api/tools/WRENCH-001").json()["tool"]
         assert tool["status"] == "available"
+
+
+class TestReserveRegressionNoDuplicateWhileReserved:
+    def test_reserved_state_duplicate_rejected_returns_409(self):
+        requests.post(f"{BASE}/api/tools/WRENCH-001/reserve", json={
+            "operator": "zhang_san", "reserve_for": "zhang_san"
+        })
+        tool = requests.get(f"{BASE}/api/tools/WRENCH-001").json()["tool"]
+        assert tool["status"] == "reserved"
+        assert tool["reserved_for"] == "zhang_san"
+
+        r = requests.post(f"{BASE}/api/tools/WRENCH-001/reserve", json={
+            "operator": "zhang_san", "reserve_for": "zhang_san"
+        })
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert detail["error"] == "duplicate_reservation"
+        assert detail["existing_status"] == "fulfilled"
+        assert detail["reserve_for"] == "zhang_san"
+
+        res = requests.get(f"{BASE}/api/tools/WRENCH-001/reservations").json()["reservations"]
+        active = [x for x in res if x["status"] in ("waiting", "fulfilled")]
+        assert len(active) == 1
+        assert active[0]["status"] == "fulfilled"
+        assert active[0]["reserve_for"] == "zhang_san"
+
+    def test_duplicate_rejection_writes_failed_audit(self):
+        requests.post(f"{BASE}/api/tools/WRENCH-001/reserve", json={
+            "operator": "zhang_san", "reserve_for": "zhang_san"
+        })
+        requests.post(f"{BASE}/api/tools/WRENCH-001/reserve", json={
+            "operator": "zhang_san", "reserve_for": "zhang_san"
+        })
+        r = requests.get(f"{BASE}/api/audit", params={
+            "action": "reserve", "tool_id": "WRENCH-001", "success": 0
+        })
+        assert r.json()["count"] >= 1
+        last_fail = r.json()["audit_log"][0]
+        assert last_fail["success"] is False
+        assert "未完成预约" in last_fail["detail"]
+
+
+class TestOverdueReturnFulfillsReservation:
+    def test_real_overdue_return_triggers_fulfillment(self):
+        requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 1
+        })
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tools SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001'")
+        conn.execute("UPDATE borrow_records SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001' AND return_time IS NULL")
+        conn.commit()
+        conn.close()
+
+        requests.post(f"{BASE}/api/tools/DRILL-001/reserve", json={
+            "operator": "li_si", "reserve_for": "li_si"
+        })
+
+        ret = requests.post(f"{BASE}/api/tools/DRILL-001/return", json={
+            "operator": "zhang_san"
+        })
+        assert ret.status_code == 200
+        body = ret.json()
+        assert body["is_overdue"] is True
+        assert body["new_status"] == "reserved"
+
+        tool = requests.get(f"{BASE}/api/tools/DRILL-001").json()["tool"]
+        assert tool["status"] == "reserved"
+        assert tool["reserved_for"] == "li_si"
+        assert tool["retained_until"] is not None
+
+        res = requests.get(f"{BASE}/api/tools/DRILL-001/reservations").json()["reservations"]
+        li_si_res = [x for x in res if x["reserve_for"] == "li_si"]
+        assert len(li_si_res) == 1
+        assert li_si_res[0]["status"] == "fulfilled"
+        assert li_si_res[0]["fulfilled_at"] is not None
+
+    def test_overdue_return_no_queue_stays_overdue_returned(self):
+        requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 1
+        })
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tools SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001'")
+        conn.execute("UPDATE borrow_records SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001' AND return_time IS NULL")
+        conn.commit()
+        conn.close()
+
+        ret = requests.post(f"{BASE}/api/tools/DRILL-001/return", json={
+            "operator": "zhang_san"
+        })
+        assert ret.status_code == 200
+        assert ret.json()["new_status"] == "overdue_returned"
+        assert ret.json()["is_overdue"] is True
+
+        tool = requests.get(f"{BASE}/api/tools/DRILL-001").json()["tool"]
+        assert tool["status"] == "overdue_returned"
+        assert tool["reserved_for"] is None
+
+    def test_overdue_return_fulfilled_blocks_non_reserver_from_borrowing(self):
+        requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 1
+        })
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tools SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001'")
+        conn.execute("UPDATE borrow_records SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001' AND return_time IS NULL")
+        conn.commit()
+        conn.close()
+
+        requests.post(f"{BASE}/api/tools/DRILL-001/reserve", json={
+            "operator": "li_si", "reserve_for": "li_si"
+        })
+        requests.post(f"{BASE}/api/tools/DRILL-001/return", json={
+            "operator": "zhang_san"
+        })
+
+        r = requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "admin", "borrower": "admin"
+        })
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert detail["error"] == "tool_reserved"
+        assert detail["reserved_for"] == "li_si"
+
+    def test_overdue_return_fulfilled_audit_log_exists(self):
+        requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 1
+        })
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tools SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001'")
+        conn.execute("UPDATE borrow_records SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001' AND return_time IS NULL")
+        conn.commit()
+        conn.close()
+
+        requests.post(f"{BASE}/api/tools/DRILL-001/reserve", json={
+            "operator": "li_si", "reserve_for": "li_si"
+        })
+        requests.post(f"{BASE}/api/tools/DRILL-001/return", json={
+            "operator": "zhang_san"
+        })
+
+        r = requests.get(f"{BASE}/api/audit", params={
+            "action": "reservation_fulfilled", "tool_id": "DRILL-001"
+        })
+        assert r.json()["count"] >= 1
+        log = r.json()["audit_log"][0]
+        assert "保留给 li_si" in log["detail"]
+
+    def test_overdue_return_fulfilled_reserver_can_borrow(self):
+        requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 1
+        })
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE tools SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001'")
+        conn.execute("UPDATE borrow_records SET due_time='2020-01-01T00:00:00+00:00' WHERE tool_id='DRILL-001' AND return_time IS NULL")
+        conn.commit()
+        conn.close()
+
+        requests.post(f"{BASE}/api/tools/DRILL-001/reserve", json={
+            "operator": "li_si", "reserve_for": "li_si"
+        })
+        requests.post(f"{BASE}/api/tools/DRILL-001/return", json={
+            "operator": "zhang_san"
+        })
+
+        r = requests.post(f"{BASE}/api/tools/DRILL-001/borrow", json={
+            "operator": "li_si", "borrower": "li_si"
+        })
+        assert r.status_code == 200
+        assert r.json()["borrower"] == "li_si"
+
+        tool = requests.get(f"{BASE}/api/tools/DRILL-001").json()["tool"]
+        assert tool["status"] == "borrowed"
+        assert tool["current_borrower"] == "li_si"
+        assert tool["reserved_for"] is None
+

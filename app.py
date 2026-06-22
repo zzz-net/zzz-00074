@@ -538,12 +538,13 @@ def api_tool_return(tool_id: str, req: ReturnRequest):
         if tool["due_time"]:
             due_dt = datetime.fromisoformat(tool["due_time"])
             is_overdue_now = datetime.now(timezone.utc) > due_dt
-        new_status = "overdue_returned" if is_overdue_now else "available"
         if tool["damage_note"]:
-            new_status = "damaged"
+            final_status = "damaged"
+        else:
+            final_status = "available"
         conn.execute(
             "UPDATE tools SET status=?, current_borrower=NULL, return_time=?, is_overdue=?, reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
-            (new_status, return_time, int(is_overdue_now), tool_id),
+            (final_status, return_time, int(is_overdue_now), tool_id),
         )
         conn.execute(
             "UPDATE borrow_records SET return_time=?, is_overdue=? WHERE tool_id=? AND return_time IS NULL AND borrower=?",
@@ -554,14 +555,26 @@ def api_tool_return(tool_id: str, req: ReturnRequest):
             conn, "return", req.operator, tool_id,
             detail=f"归还工具{overdue_flag}，原借用人 {tool['current_borrower']}", success=1,
         )
-        if new_status == "available":
+        if final_status == "available":
             fulfill_next_reservation(conn, tool_id)
+            after = conn.execute(
+                "SELECT status FROM tools WHERE tool_id = ?", (tool_id,)
+            ).fetchone()
+            if after["status"] == "available" and is_overdue_now:
+                conn.execute(
+                    "UPDATE tools SET status='overdue_returned' WHERE tool_id = ?", (tool_id,)
+                )
+                final_display = "overdue_returned"
+            else:
+                final_display = after["status"]
+        else:
+            final_display = final_status
     return {
         "ok": True,
         "tool_id": tool_id,
         "return_time": return_time,
         "is_overdue": is_overdue_now,
-        "new_status": new_status,
+        "new_status": final_display,
     }
 
 
@@ -937,20 +950,21 @@ def api_tool_reserve(tool_id: str, req: ReserveRequest):
                 "reserve_for": req.reserve_for,
             })
         existing = conn.execute(
-            "SELECT id FROM reservations WHERE tool_id = ? AND reserve_for = ? AND status = 'waiting'",
+            "SELECT id, status FROM reservations WHERE tool_id = ? AND reserve_for = ? AND status IN ('waiting','fulfilled')",
             (tool_id, req.reserve_for),
         ).fetchone()
         if existing:
             write_audit(
                 conn, "reserve", req.operator, tool_id,
-                detail=f"预约失败：操作员 '{req.reserve_for}' 已在该工具的等待队列中", success=0,
+                detail=f"预约失败：操作员 '{req.reserve_for}' 对该工具存在未完成预约（状态 {existing['status']}），不能重复占位", success=0,
             )
             conn.commit()
             raise HTTPException(status_code=409, detail={
                 "error": "duplicate_reservation",
-                "message": f"操作员 '{req.reserve_for}' 已在工具 '{tool_id}' 的等待队列中，不能重复占位",
+                "message": f"操作员 '{req.reserve_for}' 已对工具 '{tool_id}' 存在未完成预约（状态: {existing['status']}），不能重复占位",
                 "tool_id": tool_id,
                 "reserve_for": req.reserve_for,
+                "existing_status": existing["status"],
             })
         created_at = now_iso()
         conn.execute(
