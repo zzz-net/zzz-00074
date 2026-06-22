@@ -9,18 +9,25 @@ pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
+## 测试
+
+```bash
+pip install pytest requests
+python -m pytest test_tool_station.py -v
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/init` | 初始化样例数据 |
-| POST | `/api/tools/import` | 导入工具清单 |
+| POST | `/api/tools/import` | 导入工具清单（**原子操作**：有重复则整批拒绝） |
 | GET | `/api/tools` | 查看所有工具 |
 | GET | `/api/tools/{tool_id}` | 查看单件工具详情 |
 | POST | `/api/tools/{tool_id}/borrow` | 借出工具 |
 | POST | `/api/tools/{tool_id}/return` | 归还工具 |
-| POST | `/api/tools/{tool_id}/damage` | 上报损坏 |
-| POST | `/api/tools/{tool_id}/damage/close` | 关闭损坏报告（仅 admin） |
+| POST | `/api/tools/{tool_id}/damage` | 上报损坏（借出状态下不改变 status） |
+| POST | `/api/tools/{tool_id}/damage/close` | 关闭损坏报告（仅 admin；借出状态下保留借出状态） |
 | POST | `/api/overdue/check` | 检查并标记逾期工具 |
 | GET | `/api/rules` | 获取逾期规则 |
 | PUT | `/api/rules` | 修改逾期规则（仅 admin） |
@@ -34,10 +41,12 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | status 值 | 含义 |
 |-----------|------|
 | `available` | 可借 |
-| `borrowed` | 已借出 |
-| `overdue` | 已逾期 |
-| `damaged` | 已损坏 |
+| `borrowed` | 已借出（可能同时有 `damage_note` 损坏备注） |
+| `overdue` | 已逾期（可能同时有 `damage_note` 损坏备注） |
+| `damaged` | 已损坏（不在借出中） |
 | `overdue_returned` | 逾期已归还 |
+
+**损坏状态说明**：借出状态下上报损坏不会改变 `status`，仅在 `damage_note` 字段记录损坏信息，`current_borrower` 保持不变。归还时若存在损坏备注，工具状态才会转为 `damaged`。
 
 ## 工具对象字段
 
@@ -104,14 +113,14 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 | 操作 | admin | user |
 |------|-------|------|
-| 导入工具 | ✅ | ❌ |
-| 借出工具 | ✅ | ✅ |
-| 归还工具 | ✅（任意） | ✅（仅自己借的） |
-| 上报损坏 | ✅ | ✅ |
-| 关闭损坏报告 | ✅ | ❌ |
-| 修改规则 | ✅ | ❌ |
-| 注册操作员 | ✅ | ❌ |
-| 查看信息 | ✅ | ✅ |
+| 导入工具 | Y | N |
+| 借出工具 | Y | Y |
+| 归还工具 | Y（任意） | Y（仅自己借的） |
+| 上报损坏 | Y | Y |
+| 关闭损坏报告 | Y | N |
+| 修改规则 | Y | N |
+| 注册操作员 | Y | N |
+| 查看信息 | Y | Y |
 
 ## curl 示例
 
@@ -132,34 +141,58 @@ curl -X POST http://localhost:8000/api/init
 
 ### 2. 导入工具清单
 
+**原子性**：批量导入是原子操作。只要有任何一个工具编号重复，整批全部拒绝，无部分写入。
+
 ```bash
 curl -X POST http://localhost:8000/api/tools/import \
   -H "Content-Type: application/json" \
   -d '{
     "tools": [
       {"tool_id": "SAW-001", "name": "手锯", "category": "手动工具"},
-      {"tool_id": "WRENCH-001", "name": "重复扳手", "category": "手动工具"}
+      {"tool_id": "WRENCH-001", "name": "重复扳手", "category": "手动工具"},
+      {"tool_id": "HAMMER-001", "name": "新锤子", "category": "手动工具"}
     ],
     "operator": "admin"
   }'
 ```
 
-返回（WRENCH-001 已存在，作为重复跳过）：
+返回（WRENCH-001 已存在，**整批拒绝**，SAW-001 和 HAMMER-001 均未导入，HTTP 409）：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_tool_ids",
+    "message": "整批导入被拒绝：检测到 1 个重复工具编号（WRENCH-001），全部工具均未导入",
+    "duplicates": [
+      {
+        "tool_id": "WRENCH-001",
+        "existing_name": "10mm 扳手",
+        "existing_status": "available",
+        "current_borrower": null
+      }
+    ],
+    "rejected_count": 3,
+    "duplicate_count": 1
+  }
+}
+```
+
+无重复时成功返回：
+
+```bash
+curl -X POST http://localhost:8000/api/tools/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tools": [{"tool_id": "SAW-001", "name": "手锯", "category": "手动工具"}],
+    "operator": "admin"
+  }'
+```
 
 ```json
 {
   "ok": true,
   "imported": ["SAW-001"],
-  "duplicates": [
-    {
-      "tool_id": "WRENCH-001",
-      "existing_name": "10mm 扳手",
-      "existing_status": "available",
-      "current_borrower": null
-    }
-  ],
-  "imported_count": 1,
-  "duplicates_count": 1
+  "imported_count": 1
 }
 ```
 
@@ -250,10 +283,53 @@ curl -X POST http://localhost:8000/api/tools/WRENCH-001/return \
 
 ### 9. 上报损坏
 
+借出状态下上报损坏**不会改变 `status`**，也不会清除 `current_borrower`，仅记录损坏信息。借用人仍可正常归还。归还时如果存在损坏记录，工具会自动转为 `damaged` 状态。
+
 ```bash
+# 借出状态下上报损坏
+curl -X POST http://localhost:8000/api/tools/DRILL-001/borrow \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "li_si", "borrower": "li_si"}'
+
 curl -X POST http://localhost:8000/api/tools/DRILL-001/damage \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si", "damage_note": "电钻线缆断裂"}'
+```
+
+返回（借出状态下上报，`status` 仍为 `borrowed`，`current_borrower` 保留）：
+
+```json
+{
+  "ok": true,
+  "tool_id": "DRILL-001",
+  "damage_note": "电钻线缆断裂",
+  "damage_reporter": "li_si",
+  "damage_report_time": "2026-06-22T10:30:00+00:00",
+  "current_status": "borrowed",
+  "current_borrower": "li_si"
+}
+```
+
+可用状态下上报损坏会直接标记为 `damaged`：
+
+```bash
+curl -X POST http://localhost:8000/api/tools/LADDER-001/damage \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "li_si", "damage_note": "梯子铰链松动"}'
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "tool_id": "LADDER-001",
+  "damage_note": "梯子铰链松动",
+  "damage_reporter": "li_si",
+  "damage_report_time": "2026-06-22T10:30:00+00:00",
+  "current_status": "damaged",
+  "current_borrower": null
+}
 ```
 
 ### 10. 借用人关闭损坏报告（失败）
@@ -264,7 +340,7 @@ curl -X POST http://localhost:8000/api/tools/DRILL-001/damage/close \
   -d '{"operator": "li_si"}'
 ```
 
-返回（403，当前状态和损坏信息不被覆盖）：
+返回（403，当前状态和损坏信息不被覆盖，借出状态下保留借用人）：
 
 ```json
 {
@@ -272,8 +348,8 @@ curl -X POST http://localhost:8000/api/tools/DRILL-001/damage/close \
     "error": "permission_denied",
     "message": "操作员 'li_si' 无权关闭损坏报告，需要 admin 角色",
     "tool_id": "DRILL-001",
-    "current_status": "damaged",
-    "current_borrower": null,
+    "current_status": "borrowed",
+    "current_borrower": "li_si",
     "damage_note": "电钻线缆断裂",
     "damage_reporter": "li_si"
   }
@@ -286,6 +362,28 @@ curl -X POST http://localhost:8000/api/tools/DRILL-001/damage/close \
 curl -X POST http://localhost:8000/api/tools/DRILL-001/damage/close \
   -H "Content-Type: application/json" \
   -d '{"operator": "admin"}'
+```
+
+借出状态下关闭损坏，会保留借出状态和借用人：
+
+```json
+{
+  "ok": true,
+  "tool_id": "DRILL-001",
+  "new_status": "borrowed",
+  "current_borrower": "li_si"
+}
+```
+
+非借出状态下关闭损坏，会恢复为 `available`：
+
+```json
+{
+  "ok": true,
+  "tool_id": "LADDER-001",
+  "new_status": "available",
+  "current_borrower": null
+}
 ```
 
 ### 12. 检查并标记逾期
@@ -366,24 +464,28 @@ curl -X POST http://localhost:8000/api/tools/WRENCH-001/return \
   -H "Content-Type: application/json" \
   -d '{"operator": "zhang_san"}'
 
-# 4. 借出电钻并上报损坏
+# 4. 借出电钻
 curl -X POST http://localhost:8000/api/tools/DRILL-001/borrow \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si", "borrower": "li_si"}'
 
+# 5. 借出期间上报损坏（不改变借出状态，current_borrower 保留）
 curl -X POST http://localhost:8000/api/tools/DRILL-001/damage \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si", "damage_note": "开关失灵"}'
 
-# 5. 归还损坏的电钻（自动标记为 damaged 状态）
+# 6. 查看工具状态（仍是 borrowed，current_borrower 为 li_si，有 damage_note）
+curl http://localhost:8000/api/tools/DRILL-001
+
+# 7. 归还损坏的电钻（归还后自动转为 damaged 状态）
 curl -X POST http://localhost:8000/api/tools/DRILL-001/return \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si"}'
 
-# 6. 导出审计
+# 8. 导出审计
 curl http://localhost:8000/api/audit
 
-# 7. 查询扳手历史
+# 9. 查询扳手历史
 curl http://localhost:8000/api/tools/WRENCH-001/history
 ```
 
