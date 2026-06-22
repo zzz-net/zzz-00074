@@ -220,7 +220,6 @@ def api_tools_import(req: ToolsImportRequest):
                 "current_operator": req.operator,
                 "current_role": role,
             })
-        imported = []
         duplicates = []
         for t in req.tools:
             existing = conn.execute(
@@ -234,11 +233,22 @@ def api_tools_import(req: ToolsImportRequest):
                     "existing_status": existing["status"],
                     "current_borrower": existing["current_borrower"],
                 })
+        if duplicates:
+            for t in req.tools:
                 write_audit(
                     conn, "import_tool", req.operator, t.tool_id,
-                    detail=f"重复工具编号 {t.tool_id}，已跳过", success=0,
+                    detail=f"整批拒绝：工具编号 {t.tool_id} 因批量中存在重复编号（{', '.join(d['tool_id'] for d in duplicates)}）被拒绝", success=0,
                 )
-                continue
+            conn.commit()
+            raise HTTPException(status_code=409, detail={
+                "error": "duplicate_tool_ids",
+                "message": f"整批导入被拒绝：检测到 {len(duplicates)} 个重复工具编号（{', '.join(d['tool_id'] for d in duplicates)}），全部工具均未导入",
+                "duplicates": duplicates,
+                "rejected_count": len(req.tools),
+                "duplicate_count": len(duplicates),
+            })
+        imported = []
+        for t in req.tools:
             conn.execute(
                 "INSERT INTO tools (tool_id, name, category, status, is_overdue, created_at) VALUES (?,?,?,'available',0,?)",
                 (t.tool_id, t.name, t.category, now_iso()),
@@ -251,9 +261,7 @@ def api_tools_import(req: ToolsImportRequest):
     return {
         "ok": True,
         "imported": imported,
-        "duplicates": duplicates,
         "imported_count": len(imported),
-        "duplicates_count": len(duplicates),
     }
 
 
@@ -408,10 +416,10 @@ def api_tool_damage(tool_id: str, req: DamageReportRequest):
                 "message": f"工具 '{tool_id}' 不存在",
                 "tool_id": tool_id,
             })
-        if tool["status"] == "damaged":
+        if tool["damage_note"]:
             write_audit(
                 conn, "damage_report", req.operator, tool_id,
-                detail=f"损坏上报失败：工具已标记为损坏", success=0,
+                detail=f"损坏上报失败：工具已有损坏记录", success=0,
             )
             conn.commit()
             raise HTTPException(status_code=409, detail={
@@ -419,17 +427,27 @@ def api_tool_damage(tool_id: str, req: DamageReportRequest):
                 "message": f"工具 '{tool_id}' 已有损坏记录",
                 "tool_id": tool_id,
                 "current_status": tool["status"],
+                "current_borrower": tool["current_borrower"],
                 "damage_note": tool["damage_note"],
                 "damage_reporter": tool["damage_reporter"],
             })
         report_time = now_iso()
-        conn.execute(
-            "UPDATE tools SET damage_note=?, damage_reporter=?, damage_report_time=?, status='damaged' WHERE tool_id=?",
-            (req.damage_note, req.operator, report_time, tool_id),
-        )
+        is_borrowed = tool["status"] in ("borrowed", "overdue")
+        if is_borrowed:
+            conn.execute(
+                "UPDATE tools SET damage_note=?, damage_reporter=?, damage_report_time=? WHERE tool_id=?",
+                (req.damage_note, req.operator, report_time, tool_id),
+            )
+            new_status = tool["status"]
+        else:
+            conn.execute(
+                "UPDATE tools SET damage_note=?, damage_reporter=?, damage_report_time=?, status='damaged' WHERE tool_id=?",
+                (req.damage_note, req.operator, report_time, tool_id),
+            )
+            new_status = "damaged"
         write_audit(
             conn, "damage_report", req.operator, tool_id,
-            detail=f"上报损坏：{req.damage_note}", success=1,
+            detail=f"上报损坏：{req.damage_note}（借出状态: {is_borrowed}）", success=1,
         )
     return {
         "ok": True,
@@ -437,6 +455,8 @@ def api_tool_damage(tool_id: str, req: DamageReportRequest):
         "damage_note": req.damage_note,
         "damage_reporter": req.operator,
         "damage_report_time": report_time,
+        "current_status": new_status,
+        "current_borrower": tool["current_borrower"] if is_borrowed else None,
     }
 
 
@@ -450,17 +470,18 @@ def api_tool_damage_close(tool_id: str, req: DamageCloseRequest):
                 "message": f"工具 '{tool_id}' 不存在",
                 "tool_id": tool_id,
             })
-        if tool["status"] != "damaged":
+        if not tool["damage_note"]:
             write_audit(
                 conn, "damage_close", req.operator, tool_id,
-                detail=f"关闭损坏失败：工具状态为 {tool['status']}", success=0,
+                detail=f"关闭损坏失败：工具无损坏记录", success=0,
             )
             conn.commit()
             raise HTTPException(status_code=409, detail={
                 "error": "not_damaged",
-                "message": f"工具 '{tool_id}' 当前非损坏状态",
+                "message": f"工具 '{tool_id}' 无损坏记录可关闭",
                 "tool_id": tool_id,
                 "current_status": tool["status"],
+                "current_borrower": tool["current_borrower"],
             })
         role = get_operator_role(conn, req.operator)
         if role != "admin":
@@ -478,18 +499,30 @@ def api_tool_damage_close(tool_id: str, req: DamageCloseRequest):
                 "damage_note": tool["damage_note"],
                 "damage_reporter": tool["damage_reporter"],
             })
-        conn.execute(
-            "UPDATE tools SET damage_note=NULL, damage_reporter=NULL, damage_report_time=NULL, status='available' WHERE tool_id=?",
-            (tool_id,),
-        )
+        is_borrowed = tool["status"] in ("borrowed", "overdue")
+        if is_borrowed:
+            conn.execute(
+                "UPDATE tools SET damage_note=NULL, damage_reporter=NULL, damage_report_time=NULL WHERE tool_id=?",
+                (tool_id,),
+            )
+            new_status = tool["status"]
+            borrower_kept = tool["current_borrower"]
+        else:
+            conn.execute(
+                "UPDATE tools SET damage_note=NULL, damage_reporter=NULL, damage_report_time=NULL, status='available' WHERE tool_id=?",
+                (tool_id,),
+            )
+            new_status = "available"
+            borrower_kept = None
         write_audit(
             conn, "damage_close", req.operator, tool_id,
-            detail=f"关闭损坏报告，工具恢复可用", success=1,
+            detail=f"关闭损坏报告（借出状态: {is_borrowed}），工具状态: {new_status}", success=1,
         )
     return {
         "ok": True,
         "tool_id": tool_id,
-        "new_status": "available",
+        "new_status": new_status,
+        "current_borrower": borrower_kept,
     }
 
 
