@@ -1,6 +1,6 @@
 # 工具借用亭 JSON API
 
-本地工具借用管理系统，提供工具目录、逾期规则、借出归还、损坏上报、权限校验和审计日志，不依赖门禁或库存系统。
+本地工具借用管理系统，提供工具目录、逾期规则、借出归还、损坏上报、预约排队、权限校验和审计日志，不依赖门禁或库存系统。
 
 ## 启动
 
@@ -35,6 +35,12 @@ python -m pytest test_tool_station.py -v
 | GET | `/api/audit` | 导出审计日志 |
 | POST | `/api/operators` | 注册操作员（仅 admin） |
 | GET | `/api/operators` | 查看所有操作员 |
+| POST | `/api/tools/{tool_id}/reserve` | 创建预约 |
+| GET | `/api/tools/{tool_id}/reservations` | 查看工具预约队列 |
+| DELETE | `/api/tools/{tool_id}/reservations/{reservation_id}` | 取消单条预约 |
+| DELETE | `/api/tools/{tool_id}/reservations` | 管理员清队（仅 admin） |
+| GET | `/api/reservation-config` | 获取预约配置 |
+| PUT | `/api/reservation-config` | 修改预约配置（仅 admin） |
 
 ## 工具状态字段
 
@@ -45,8 +51,11 @@ python -m pytest test_tool_station.py -v
 | `overdue` | 已逾期（可能同时有 `damage_note` 损坏备注） |
 | `damaged` | 已损坏（不在借出中） |
 | `overdue_returned` | 逾期已归还 |
+| `reserved` | 已预约保留（仅预约人可在保留期内借出） |
 
 **损坏状态说明**：借出状态下上报损坏不会改变 `status`，仅在 `damage_note` 字段记录损坏信息，`current_borrower` 保持不变。归还时若存在损坏备注，工具状态才会转为 `damaged`。
+
+**预约保留状态说明**：当工具归还且有等待中的预约时，工具自动进入 `reserved` 状态，`reserved_for` 记录保留给谁，`retained_until` 记录保留截止时间。在保留期内仅预约人可借出；保留期结束后自动流转到下一位预约人或回到 `available`。
 
 ## 工具对象字段
 
@@ -65,6 +74,8 @@ python -m pytest test_tool_station.py -v
 | `damage_report_time` | string\|null | 损坏上报时间 |
 | `is_overdue` | boolean | 是否逾期 |
 | `created_at` | string | 创建时间 |
+| `reserved_for` | string\|null | 预约保留给谁 |
+| `retained_until` | string\|null | 保留截止时间（ISO 8601） |
 
 ## 逾期规则字段
 
@@ -79,7 +90,7 @@ python -m pytest test_tool_station.py -v
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | integer | 日志 ID |
-| `action` | string | 操作类型（init / import_tool / borrow / return / damage_report / damage_close / overdue_mark / rules_update / register_operator） |
+| `action` | string | 操作类型（init / import_tool / borrow / return / damage_report / damage_close / overdue_mark / rules_update / register_operator / reserve / reserve_cancel / reserve_clear / reservation_fulfilled / reservation_expired / reservation_config_update） |
 | `tool_id` | string\|null | 关联工具编号 |
 | `operator` | string | 操作人 |
 | `detail` | string\|null | 详细信息 |
@@ -109,6 +120,27 @@ python -m pytest test_tool_station.py -v
 | `display_name` | string | 显示名 |
 | `role` | string | 角色（admin / user） |
 
+## 预约记录字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | integer | 预约 ID |
+| `tool_id` | string | 工具编号 |
+| `operator_id` | string | 创建预约的操作员 |
+| `reserve_for` | string | 预约目标操作员 |
+| `status` | string | 预约状态（waiting / fulfilled / cancelled / expired） |
+| `created_at` | string | 创建时间 |
+| `fulfilled_at` | string\|null | 兑现时间 |
+| `cancelled_at` | string\|null | 取消时间 |
+| `expired_at` | string\|null | 过期时间 |
+
+## 预约配置字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `reservation_enabled` | boolean | 是否开启预约功能 |
+| `retain_minutes` | integer | 归还后保留给预约人的分钟数 |
+
 ## 权限规则
 
 | 操作 | admin | user |
@@ -121,6 +153,28 @@ python -m pytest test_tool_station.py -v
 | 修改规则 | Y | N |
 | 注册操作员 | Y | N |
 | 查看信息 | Y | Y |
+| 创建预约 | Y（可代他人） | Y（仅为自己） |
+| 取消预约 | Y（任意） | Y（仅自己的） |
+| 清除预约队列 | Y | N |
+| 修改预约配置 | Y | N |
+
+## 预约排队流程
+
+1. **创建预约**：对 `available`、`borrowed`、`overdue`、`reserved` 状态的工具均可创建预约，按先来先到排队
+2. **归还触发兑现**：工具归还后，若变为 `available` 且有等待中的预约，自动将第一位预约人标记为 `fulfilled`，工具进入 `reserved` 状态，设置 `reserved_for` 和 `retained_until`
+3. **保留期借出**：在 `reserved` 状态下仅 `reserved_for` 指定的操作员可借出；其他人尝试借出会被 `tool_reserved` 错误拦截
+4. **保留期超时**：若保留期到期预约人未借出，预约自动标记为 `expired`，系统自动流转到下一位预约人或回到 `available`
+5. **取消补位**：取消已兑现的预约后，自动触发下一位预约人进入保留期
+6. **管理员清队**：管理员可一键清除所有活跃预约，工具回到 `available`
+7. **关闭预约功能**：管理员通过配置关闭预约功能时，所有处于 `reserved` 状态的工具回到 `available`，已兑现的预约被取消
+
+### 同一操作员不可重复占位
+
+同一操作员对同一工具只能有一条 `waiting` 状态的预约，重复预约返回 `duplicate_reservation` 错误。
+
+### 管理员代约
+
+管理员创建预约时可指定 `reserve_for` 为其他操作员；普通用户 `reserve_for` 必须等于 `operator`。
 
 ## curl 示例
 
@@ -448,6 +502,200 @@ curl -X POST http://localhost:8000/api/operators \
 curl http://localhost:8000/api/operators
 ```
 
+### 19. 创建预约
+
+对 `available`、`borrowed`、`overdue`、`reserved` 状态的工具可创建预约。普通用户只能为自己预约，管理员可代他人预约。
+
+```bash
+# 普通用户为自己预约
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "zhang_san", "reserve_for": "zhang_san"}'
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "tool_id": "WRENCH-001",
+  "reserve_for": "zhang_san",
+  "position": 1,
+  "created_at": "2026-06-22T10:00:00+00:00"
+}
+```
+
+```bash
+# 管理员代他人预约
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "reserve_for": "li_si"}'
+```
+
+普通用户代他人预约会被拒绝（403）：
+
+```json
+{
+  "detail": {
+    "error": "permission_denied",
+    "message": "普通用户 'zhang_san' 只能为自己预约，不能为他人预约",
+    "current_operator": "zhang_san",
+    "current_role": "user",
+    "reserve_for": "li_si"
+  }
+}
+```
+
+同一操作员重复预约会被拒绝（409）：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_reservation",
+    "message": "操作员 'zhang_san' 已在工具 'WRENCH-001' 的等待队列中，不能重复占位",
+    "tool_id": "WRENCH-001",
+    "reserve_for": "zhang_san"
+  }
+}
+```
+
+### 20. 查看工具预约队列
+
+```bash
+curl http://localhost:8000/api/tools/WRENCH-001/reservations
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "tool_id": "WRENCH-001",
+  "reservations": [
+    {
+      "id": 1,
+      "tool_id": "WRENCH-001",
+      "operator_id": "li_si",
+      "reserve_for": "li_si",
+      "status": "waiting",
+      "created_at": "2026-06-22T10:00:00+00:00",
+      "fulfilled_at": null,
+      "cancelled_at": null,
+      "expired_at": null
+    }
+  ],
+  "count": 1
+}
+```
+
+### 21. 取消预约
+
+普通用户只能取消自己的预约，管理员可取消任意预约。取消已兑现的预约会自动触发下一位进入保留期。
+
+```bash
+curl -X DELETE http://localhost:8000/api/tools/WRENCH-001/reservations/1 \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "li_si"}'
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "tool_id": "WRENCH-001",
+  "reservation_id": 1,
+  "cancelled_for": "li_si",
+  "previous_status": "waiting"
+}
+```
+
+### 22. 管理员清队
+
+一键清除工具的所有活跃预约（waiting 和 fulfilled），工具回到 `available`。
+
+```bash
+curl -X DELETE http://localhost:8000/api/tools/WRENCH-001/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin"}'
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "tool_id": "WRENCH-001",
+  "cleared_count": 3
+}
+```
+
+### 23. 获取预约配置
+
+```bash
+curl http://localhost:8000/api/reservation-config
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "config": {
+    "reservation_enabled": true,
+    "retain_minutes": 30
+  }
+}
+```
+
+### 24. 修改预约配置
+
+```bash
+curl -X PUT http://localhost:8000/api/reservation-config \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "retain_minutes": 60}'
+```
+
+关闭预约功能会自动清除所有 `reserved` 状态的工具：
+
+```bash
+curl -X PUT http://localhost:8000/api/reservation-config \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "reservation_enabled": false}'
+```
+
+### 25. 预约保留期借出拦截
+
+工具处于 `reserved` 状态时，非预约人尝试借出会被拦截：
+
+```bash
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "li_si", "borrower": "li_si"}'
+```
+
+返回（409）：
+
+```json
+{
+  "detail": {
+    "error": "tool_reserved",
+    "message": "工具 'WRENCH-001' 已保留给 'zhang_san'，其他人不可借出",
+    "tool_id": "WRENCH-001",
+    "reserved_for": "zhang_san",
+    "retained_until": "2026-06-22T10:30:00+00:00"
+  }
+}
+```
+
+预约人可正常借出：
+
+```bash
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "zhang_san", "borrower": "zhang_san"}'
+```
+
 ## 主流程示例
 
 ```bash
@@ -459,34 +707,55 @@ curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
   -H "Content-Type: application/json" \
   -d '{"operator": "zhang_san", "borrower": "zhang_san", "borrow_hours": 2}'
 
-# 3. 归还扳手
+# 3. 李四排队预约
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "li_si", "reserve_for": "li_si"}'
+
+# 4. 管理员也排队
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/reserve \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "reserve_for": "admin"}'
+
+# 5. 张三归还扳手 → 李四自动进入保留期
 curl -X POST http://localhost:8000/api/tools/WRENCH-001/return \
   -H "Content-Type: application/json" \
   -d '{"operator": "zhang_san"}'
 
-# 4. 借出电钻
-curl -X POST http://localhost:8000/api/tools/DRILL-001/borrow \
+# 6. 查看扳手状态（reserved，保留给 li_si）
+curl http://localhost:8000/api/tools/WRENCH-001
+
+# 7. 管理员尝试借出被拦截（tool_reserved）
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "borrower": "admin"}'
+
+# 8. 李四借出（保留期内）
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si", "borrower": "li_si"}'
 
-# 5. 借出期间上报损坏（不改变借出状态，current_borrower 保留）
-curl -X POST http://localhost:8000/api/tools/DRILL-001/damage \
-  -H "Content-Type: application/json" \
-  -d '{"operator": "li_si", "damage_note": "开关失灵"}'
-
-# 6. 查看工具状态（仍是 borrowed，current_borrower 为 li_si，有 damage_note）
-curl http://localhost:8000/api/tools/DRILL-001
-
-# 7. 归还损坏的电钻（归还后自动转为 damaged 状态）
-curl -X POST http://localhost:8000/api/tools/DRILL-001/return \
+# 9. 李四归还 → 管理员自动进入保留期
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/return \
   -H "Content-Type: application/json" \
   -d '{"operator": "li_si"}'
 
-# 8. 导出审计
-curl http://localhost:8000/api/audit
+# 10. 管理员借出
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/borrow \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin", "borrower": "admin"}'
 
-# 9. 查询扳手历史
-curl http://localhost:8000/api/tools/WRENCH-001/history
+# 11. 管理员归还 → 无预约，回到 available
+curl -X POST http://localhost:8000/api/tools/WRENCH-001/return \
+  -H "Content-Type: application/json" \
+  -d '{"operator": "admin"}'
+
+# 12. 导出审计（含预约相关操作）
+curl "http://localhost:8000/api/audit?action=reserve"
+curl "http://localhost:8000/api/audit?action=reservation_fulfilled"
+curl "http://localhost:8000/api/audit?action=reserve_cancel"
+curl "http://localhost:8000/api/audit?action=reserve_clear"
+curl "http://localhost:8000/api/audit?action=reservation_expired"
 ```
 
 ## 持久化
@@ -497,3 +766,6 @@ curl http://localhost:8000/api/tools/WRENCH-001/history
 - 损坏备注（`tools.damage_note` / `damage_reporter` / `damage_report_time`）
 - 归还时间（`tools.return_time` / `borrow_records.return_time`）
 - 审计日志（`audit_log` 表）
+- 预约配置（`reservation_config` 表）
+- 预约队列及状态（`reservations` 表）
+- 保留期状态（`tools.reserved_for` / `tools.retained_until`）

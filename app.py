@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tool_station.db")
 
-app = FastAPI(title="工具借用亭 JSON API", version="1.0.0")
+app = FastAPI(title="工具借用亭 JSON API", version="2.0.0")
 
 
 @contextmanager
@@ -28,6 +28,11 @@ def get_db():
         raise
     finally:
         conn.close()
+
+
+def _column_exists(conn, table, column):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(row["name"] == column for row in cur.fetchall())
 
 
 def init_db():
@@ -84,7 +89,33 @@ def init_db():
                 display_name TEXT,
                 role TEXT DEFAULT 'user'
             );
+
+            CREATE TABLE IF NOT EXISTS reservation_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                reservation_enabled INTEGER DEFAULT 1,
+                retain_minutes INTEGER DEFAULT 30
+            );
+
+            CREATE TABLE IF NOT EXISTS reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                reserve_for TEXT NOT NULL,
+                status TEXT DEFAULT 'waiting',
+                created_at TEXT NOT NULL,
+                fulfilled_at TEXT,
+                cancelled_at TEXT,
+                expired_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reservations_tool_status
+                ON reservations(tool_id, status);
         """)
+
+        if not _column_exists(conn, "tools", "reserved_for"):
+            conn.execute("ALTER TABLE tools ADD COLUMN reserved_for TEXT")
+        if not _column_exists(conn, "tools", "retained_until"):
+            conn.execute("ALTER TABLE tools ADD COLUMN retained_until TEXT")
 
 
 def now_iso():
@@ -114,6 +145,81 @@ def get_rules(conn):
         )
         row = conn.execute("SELECT * FROM overdue_rules WHERE id = 1").fetchone()
     return dict(row)
+
+
+def get_reservation_config(conn) -> dict:
+    row = conn.execute("SELECT * FROM reservation_config WHERE id = 1").fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO reservation_config (id, reservation_enabled, retain_minutes) VALUES (1,1,30)"
+        )
+        row = conn.execute("SELECT * FROM reservation_config WHERE id = 1").fetchone()
+    return dict(row)
+
+
+def check_reservation_expiry(conn, tool_id: str):
+    tool = conn.execute(
+        "SELECT status, reserved_for, retained_until FROM tools WHERE tool_id = ?",
+        (tool_id,),
+    ).fetchone()
+    if not tool or tool["status"] != "reserved":
+        return
+    if not tool["retained_until"]:
+        return
+    retained_until = datetime.fromisoformat(tool["retained_until"])
+    if datetime.now(timezone.utc) <= retained_until:
+        return
+    expired_res = conn.execute(
+        "SELECT id, reserve_for FROM reservations WHERE tool_id = ? AND status = 'fulfilled' AND reserve_for = ? ORDER BY fulfilled_at DESC LIMIT 1",
+        (tool_id, tool["reserved_for"]),
+    ).fetchone()
+    if expired_res:
+        conn.execute(
+            "UPDATE reservations SET status='expired', expired_at=? WHERE id=?",
+            (now_iso(), expired_res["id"]),
+        )
+        write_audit(
+            conn, "reservation_expired", "system", tool_id,
+            detail=f"预约人 {tool['reserved_for']} 保留期超时，预约 ID {expired_res['id']} 失效", success=1,
+        )
+    fulfill_next_reservation(conn, tool_id)
+
+
+def fulfill_next_reservation(conn, tool_id: str):
+    tool = conn.execute("SELECT status FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
+    if not tool or tool["status"] not in ("available", "reserved"):
+        return
+    config = get_reservation_config(conn)
+    if not config["reservation_enabled"]:
+        if tool["status"] == "reserved":
+            conn.execute(
+                "UPDATE tools SET status='available', reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
+                (tool_id,),
+            )
+        return
+    next_res = conn.execute(
+        "SELECT id, reserve_for FROM reservations WHERE tool_id = ? AND status = 'waiting' ORDER BY id ASC LIMIT 1",
+        (tool_id,),
+    ).fetchone()
+    if not next_res:
+        conn.execute(
+            "UPDATE tools SET status='available', reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
+            (tool_id,),
+        )
+        return
+    retained_until = (datetime.now(timezone.utc) + timedelta(minutes=config["retain_minutes"])).isoformat()
+    conn.execute(
+        "UPDATE tools SET status='reserved', reserved_for=?, retained_until=? WHERE tool_id=?",
+        (next_res["reserve_for"], retained_until, tool_id),
+    )
+    conn.execute(
+        "UPDATE reservations SET status='fulfilled', fulfilled_at=? WHERE id=?",
+        (now_iso(), next_res["id"]),
+    )
+    write_audit(
+        conn, "reservation_fulfilled", "system", tool_id,
+        detail=f"预约 ID {next_res['id']} 兑现，保留给 {next_res['reserve_for']}，保留至 {retained_until}", success=1,
+    )
 
 
 def tool_row_to_dict(row) -> dict:
@@ -164,6 +270,21 @@ class OperatorRegisterRequest(BaseModel):
     role: str = "user"
     admin_operator: str
 
+class ReserveRequest(BaseModel):
+    operator: str
+    reserve_for: str
+
+class ReserveCancelRequest(BaseModel):
+    operator: str
+
+class ReservationsClearRequest(BaseModel):
+    operator: str
+
+class ReservationConfigUpdateRequest(BaseModel):
+    operator: str
+    reservation_enabled: Optional[bool] = None
+    retain_minutes: Optional[int] = None
+
 
 @app.on_event("startup")
 def startup():
@@ -175,6 +296,7 @@ def api_init():
     with get_db() as conn:
         conn.execute("DELETE FROM audit_log")
         conn.execute("DELETE FROM borrow_records")
+        conn.execute("DELETE FROM reservations")
         conn.execute("DELETE FROM tools")
         conn.execute("DELETE FROM operators")
         conn.execute(
@@ -182,6 +304,12 @@ def api_init():
         )
         conn.execute(
             "INSERT INTO overdue_rules (id, max_borrow_hours, overdue_check_enabled, auto_mark_overdue) VALUES (1,24,1,1)"
+        )
+        conn.execute(
+            "DELETE FROM reservation_config WHERE id = 1"
+        )
+        conn.execute(
+            "INSERT INTO reservation_config (id, reservation_enabled, retain_minutes) VALUES (1,1,30)"
         )
         sample_tools = [
             ("WRENCH-001", "10mm 扳手", "手动工具"),
@@ -274,12 +402,22 @@ def api_tools_list(status: Optional[str] = None):
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM tools ORDER BY tool_id").fetchall()
+        for row in rows:
+            if row["status"] == "reserved":
+                check_reservation_expiry(conn, row["tool_id"])
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM tools WHERE status = ? ORDER BY tool_id", (status,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tools ORDER BY tool_id").fetchall()
     return {"ok": True, "tools": [tool_row_to_dict(r) for r in rows], "count": len(rows)}
 
 
 @app.get("/api/tools/{tool_id}")
 def api_tool_detail(tool_id: str):
     with get_db() as conn:
+        check_reservation_expiry(conn, tool_id)
         row = conn.execute("SELECT * FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail={
@@ -293,6 +431,7 @@ def api_tool_detail(tool_id: str):
 @app.post("/api/tools/{tool_id}/borrow")
 def api_tool_borrow(tool_id: str, req: BorrowRequest):
     with get_db() as conn:
+        check_reservation_expiry(conn, tool_id)
         tool = conn.execute("SELECT * FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
         if not tool:
             raise HTTPException(status_code=404, detail={
@@ -300,7 +439,25 @@ def api_tool_borrow(tool_id: str, req: BorrowRequest):
                 "message": f"工具 '{tool_id}' 不存在",
                 "tool_id": tool_id,
             })
-        if tool["status"] != "available":
+        if tool["status"] == "reserved":
+            if req.borrower != tool["reserved_for"]:
+                write_audit(
+                    conn, "borrow", req.operator, tool_id,
+                    detail=f"借出失败：工具已保留给 {tool['reserved_for']}，当前借用人 {req.borrower} 无权借出", success=0,
+                )
+                conn.commit()
+                raise HTTPException(status_code=409, detail={
+                    "error": "tool_reserved",
+                    "message": f"工具 '{tool_id}' 已保留给 '{tool['reserved_for']}'，其他人不可借出",
+                    "tool_id": tool_id,
+                    "reserved_for": tool["reserved_for"],
+                    "retained_until": tool["retained_until"],
+                })
+            fulfilled_res = conn.execute(
+                "SELECT id FROM reservations WHERE tool_id = ? AND status = 'fulfilled' AND reserve_for = ? ORDER BY fulfilled_at DESC LIMIT 1",
+                (tool_id, req.borrower),
+            ).fetchone()
+        elif tool["status"] != "available":
             write_audit(
                 conn, "borrow", req.operator, tool_id,
                 detail=f"借出失败：工具状态为 {tool['status']}", success=0,
@@ -318,7 +475,7 @@ def api_tool_borrow(tool_id: str, req: BorrowRequest):
         borrow_time = now_iso()
         due_time = (datetime.now(timezone.utc) + timedelta(hours=borrow_hours)).isoformat()
         conn.execute(
-            "UPDATE tools SET status='borrowed', current_borrower=?, borrow_time=?, due_time=?, return_time=NULL, is_overdue=0 WHERE tool_id=?",
+            "UPDATE tools SET status='borrowed', current_borrower=?, borrow_time=?, due_time=?, return_time=NULL, is_overdue=0, reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
             (req.borrower, borrow_time, due_time, tool_id),
         )
         conn.execute(
@@ -385,7 +542,7 @@ def api_tool_return(tool_id: str, req: ReturnRequest):
         if tool["damage_note"]:
             new_status = "damaged"
         conn.execute(
-            "UPDATE tools SET status=?, current_borrower=NULL, return_time=?, is_overdue=? WHERE tool_id=?",
+            "UPDATE tools SET status=?, current_borrower=NULL, return_time=?, is_overdue=?, reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
             (new_status, return_time, int(is_overdue_now), tool_id),
         )
         conn.execute(
@@ -397,6 +554,8 @@ def api_tool_return(tool_id: str, req: ReturnRequest):
             conn, "return", req.operator, tool_id,
             detail=f"归还工具{overdue_flag}，原借用人 {tool['current_borrower']}", success=1,
         )
+        if new_status == "available":
+            fulfill_next_reservation(conn, tool_id)
     return {
         "ok": True,
         "tool_id": tool_id,
@@ -441,7 +600,7 @@ def api_tool_damage(tool_id: str, req: DamageReportRequest):
             new_status = tool["status"]
         else:
             conn.execute(
-                "UPDATE tools SET damage_note=?, damage_reporter=?, damage_report_time=?, status='damaged' WHERE tool_id=?",
+                "UPDATE tools SET damage_note=?, damage_reporter=?, damage_report_time=?, status='damaged', reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
                 (req.damage_note, req.operator, report_time, tool_id),
             )
             new_status = "damaged"
@@ -509,7 +668,7 @@ def api_tool_damage_close(tool_id: str, req: DamageCloseRequest):
             borrower_kept = tool["current_borrower"]
         else:
             conn.execute(
-                "UPDATE tools SET damage_note=NULL, damage_reporter=NULL, damage_report_time=NULL, status='available' WHERE tool_id=?",
+                "UPDATE tools SET damage_note=NULL, damage_reporter=NULL, damage_report_time=NULL, status='available', reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
                 (tool_id,),
             )
             new_status = "available"
@@ -518,6 +677,8 @@ def api_tool_damage_close(tool_id: str, req: DamageCloseRequest):
             conn, "damage_close", req.operator, tool_id,
             detail=f"关闭损坏报告（借出状态: {is_borrowed}），工具状态: {new_status}", success=1,
         )
+        if new_status == "available":
+            fulfill_next_reservation(conn, tool_id)
     return {
         "ok": True,
         "tool_id": tool_id,
@@ -711,3 +872,298 @@ def api_operators_list():
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM operators ORDER BY operator_id").fetchall()
     return {"ok": True, "operators": [dict(r) for r in rows], "count": len(rows)}
+
+
+@app.post("/api/tools/{tool_id}/reserve")
+def api_tool_reserve(tool_id: str, req: ReserveRequest):
+    with get_db() as conn:
+        tool = conn.execute("SELECT * FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
+        if not tool:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"工具 '{tool_id}' 不存在",
+                "tool_id": tool_id,
+            })
+        if tool["status"] not in ("available", "borrowed", "overdue", "reserved"):
+            write_audit(
+                conn, "reserve", req.operator, tool_id,
+                detail=f"预约失败：工具状态为 {tool['status']}，不可预约", success=0,
+            )
+            conn.commit()
+            raise HTTPException(status_code=409, detail={
+                "error": "tool_not_reservable",
+                "message": f"工具 '{tool_id}' 当前状态 '{tool['status']}' 不支持预约，仅 available/borrowed/overdue/reserved 可预约",
+                "tool_id": tool_id,
+                "current_status": tool["status"],
+            })
+        config = get_reservation_config(conn)
+        if not config["reservation_enabled"]:
+            write_audit(
+                conn, "reserve", req.operator, tool_id,
+                detail="预约失败：预约功能未开启", success=0,
+            )
+            conn.commit()
+            raise HTTPException(status_code=400, detail={
+                "error": "reservation_disabled",
+                "message": "预约功能未开启",
+                "tool_id": tool_id,
+            })
+        role = get_operator_role(conn, req.operator)
+        if role is None:
+            raise HTTPException(status_code=403, detail={
+                "error": "permission_denied",
+                "message": f"操作员 '{req.operator}' 不存在",
+                "current_operator": req.operator,
+            })
+        if role != "admin" and req.reserve_for != req.operator:
+            write_audit(
+                conn, "reserve", req.operator, tool_id,
+                detail=f"预约失败：普通用户 '{req.operator}' 只能为自己预约，不能为 '{req.reserve_for}' 预约", success=0,
+            )
+            conn.commit()
+            raise HTTPException(status_code=403, detail={
+                "error": "permission_denied",
+                "message": f"普通用户 '{req.operator}' 只能为自己预约，不能为他人预约",
+                "current_operator": req.operator,
+                "current_role": role,
+                "reserve_for": req.reserve_for,
+            })
+        if not conn.execute(
+            "SELECT operator_id FROM operators WHERE operator_id = ?", (req.reserve_for,)
+        ).fetchone():
+            raise HTTPException(status_code=400, detail={
+                "error": "invalid_reserve_for",
+                "message": f"预约目标操作员 '{req.reserve_for}' 不存在",
+                "reserve_for": req.reserve_for,
+            })
+        existing = conn.execute(
+            "SELECT id FROM reservations WHERE tool_id = ? AND reserve_for = ? AND status = 'waiting'",
+            (tool_id, req.reserve_for),
+        ).fetchone()
+        if existing:
+            write_audit(
+                conn, "reserve", req.operator, tool_id,
+                detail=f"预约失败：操作员 '{req.reserve_for}' 已在该工具的等待队列中", success=0,
+            )
+            conn.commit()
+            raise HTTPException(status_code=409, detail={
+                "error": "duplicate_reservation",
+                "message": f"操作员 '{req.reserve_for}' 已在工具 '{tool_id}' 的等待队列中，不能重复占位",
+                "tool_id": tool_id,
+                "reserve_for": req.reserve_for,
+            })
+        created_at = now_iso()
+        conn.execute(
+            "INSERT INTO reservations (tool_id, operator_id, reserve_for, status, created_at) VALUES (?,?,?,'waiting',?)",
+            (tool_id, req.operator, req.reserve_for, created_at),
+        )
+        waiting_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM reservations WHERE tool_id = ? AND status = 'waiting'",
+            (tool_id,),
+        ).fetchone()["cnt"]
+        write_audit(
+            conn, "reserve", req.operator, tool_id,
+            detail=f"创建预约：为 {req.reserve_for} 预约，当前等待人数 {waiting_count}", success=1,
+        )
+        if tool["status"] == "available":
+            check_reservation_expiry(conn, tool_id)
+            fulfill_next_reservation(conn, tool_id)
+    return {
+        "ok": True,
+        "tool_id": tool_id,
+        "reserve_for": req.reserve_for,
+        "position": waiting_count,
+        "created_at": created_at,
+    }
+
+
+@app.get("/api/tools/{tool_id}/reservations")
+def api_tool_reservations(tool_id: str):
+    with get_db() as conn:
+        tool = conn.execute("SELECT tool_id FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
+        if not tool:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"工具 '{tool_id}' 不存在",
+                "tool_id": tool_id,
+            })
+        rows = conn.execute(
+            "SELECT * FROM reservations WHERE tool_id = ? ORDER BY id ASC",
+            (tool_id,),
+        ).fetchall()
+    records = []
+    for r in rows:
+        records.append(dict(r))
+    return {"ok": True, "tool_id": tool_id, "reservations": records, "count": len(records)}
+
+
+@app.delete("/api/tools/{tool_id}/reservations/{reservation_id}")
+def api_tool_reservation_cancel(tool_id: str, reservation_id: int, req: ReserveCancelRequest):
+    with get_db() as conn:
+        tool = conn.execute("SELECT tool_id FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
+        if not tool:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"工具 '{tool_id}' 不存在",
+                "tool_id": tool_id,
+            })
+        res = conn.execute(
+            "SELECT * FROM reservations WHERE id = ? AND tool_id = ?",
+            (reservation_id, tool_id),
+        ).fetchone()
+        if not res:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"预约 ID {reservation_id} 不存在或不属于工具 '{tool_id}'",
+                "reservation_id": reservation_id,
+                "tool_id": tool_id,
+            })
+        if res["status"] not in ("waiting", "fulfilled"):
+            raise HTTPException(status_code=400, detail={
+                "error": "invalid_status",
+                "message": f"预约 ID {reservation_id} 状态为 '{res['status']}'，无法取消",
+                "reservation_id": reservation_id,
+                "current_status": res["status"],
+            })
+        role = get_operator_role(conn, req.operator)
+        if role != "admin" and res["reserve_for"] != req.operator:
+            write_audit(
+                conn, "reserve_cancel", req.operator, tool_id,
+                detail=f"取消预约失败：操作员 '{req.operator}' 无权取消他人预约（预约人: {res['reserve_for']}）", success=0,
+            )
+            conn.commit()
+            raise HTTPException(status_code=403, detail={
+                "error": "permission_denied",
+                "message": f"操作员 '{req.operator}' 只能取消自己的预约",
+                "current_operator": req.operator,
+                "current_role": role,
+                "reserve_for": res["reserve_for"],
+            })
+        was_fulfilled = res["status"] == "fulfilled"
+        conn.execute(
+            "UPDATE reservations SET status='cancelled', cancelled_at=? WHERE id=?",
+            (now_iso(), reservation_id),
+        )
+        write_audit(
+            conn, "reserve_cancel", req.operator, tool_id,
+            detail=f"取消预约 ID {reservation_id}（为 {res['reserve_for']} 预约，原状态 {res['status']}）", success=1,
+        )
+        if was_fulfilled:
+            conn.execute(
+                "UPDATE tools SET reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
+                (tool_id,),
+            )
+            fulfill_next_reservation(conn, tool_id)
+    return {
+        "ok": True,
+        "tool_id": tool_id,
+        "reservation_id": reservation_id,
+        "cancelled_for": res["reserve_for"],
+        "previous_status": res["status"],
+    }
+
+
+@app.delete("/api/tools/{tool_id}/reservations")
+def api_tool_reservations_clear(tool_id: str, req: ReservationsClearRequest):
+    with get_db() as conn:
+        tool = conn.execute("SELECT tool_id FROM tools WHERE tool_id = ?", (tool_id,)).fetchone()
+        if not tool:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"工具 '{tool_id}' 不存在",
+                "tool_id": tool_id,
+            })
+        role = get_operator_role(conn, req.operator)
+        if role != "admin":
+            raise HTTPException(status_code=403, detail={
+                "error": "permission_denied",
+                "message": f"操作员 '{req.operator}' 无清队权限，需要 admin 角色",
+                "current_operator": req.operator,
+                "current_role": role,
+            })
+        active_res = conn.execute(
+            "SELECT id, reserve_for, status FROM reservations WHERE tool_id = ? AND status IN ('waiting','fulfilled')",
+            (tool_id,),
+        ).fetchall()
+        now_str = now_iso()
+        for r in active_res:
+            conn.execute(
+                "UPDATE reservations SET status='cancelled', cancelled_at=? WHERE id=?",
+                (now_str, r["id"]),
+            )
+        conn.execute(
+            "UPDATE tools SET status='available', reserved_for=NULL, retained_until=NULL WHERE tool_id=? AND status='reserved'",
+            (tool_id,),
+        )
+        write_audit(
+            conn, "reserve_clear", req.operator, tool_id,
+            detail=f"管理员清队：清除 {len(active_res)} 条活跃预约", success=1,
+        )
+    return {
+        "ok": True,
+        "tool_id": tool_id,
+        "cleared_count": len(active_res),
+    }
+
+
+@app.get("/api/reservation-config")
+def api_reservation_config_get():
+    with get_db() as conn:
+        config = get_reservation_config(conn)
+    return {"ok": True, "config": {
+        "reservation_enabled": bool(config["reservation_enabled"]),
+        "retain_minutes": config["retain_minutes"],
+    }}
+
+
+@app.put("/api/reservation-config")
+def api_reservation_config_update(req: ReservationConfigUpdateRequest):
+    with get_db() as conn:
+        role = get_operator_role(conn, req.operator)
+        if role != "admin":
+            raise HTTPException(status_code=403, detail={
+                "error": "permission_denied",
+                "message": f"操作员 '{req.operator}' 无修改预约配置权限，需要 admin 角色",
+                "current_operator": req.operator,
+                "current_role": role,
+            })
+        config = get_reservation_config(conn)
+        if req.reservation_enabled is not None:
+            config["reservation_enabled"] = int(req.reservation_enabled)
+        if req.retain_minutes is not None:
+            config["retain_minutes"] = req.retain_minutes
+        conn.execute(
+            "UPDATE reservation_config SET reservation_enabled=?, retain_minutes=? WHERE id=1",
+            (config["reservation_enabled"], config["retain_minutes"]),
+        )
+        write_audit(
+            conn, "reservation_config_update", req.operator,
+            detail=f"更新预约配置: reservation_enabled={bool(config['reservation_enabled'])}, retain_minutes={config['retain_minutes']}",
+            success=1,
+        )
+        if not config["reservation_enabled"]:
+            reserved_tools = conn.execute(
+                "SELECT tool_id FROM tools WHERE status = 'reserved'"
+            ).fetchall()
+            for rt in reserved_tools:
+                fulfilled = conn.execute(
+                    "SELECT id FROM reservations WHERE tool_id = ? AND status = 'fulfilled'",
+                    (rt["tool_id"],),
+                ).fetchall()
+                for f in fulfilled:
+                    conn.execute(
+                        "UPDATE reservations SET status='cancelled', cancelled_at=? WHERE id=?",
+                        (now_iso(), f["id"]),
+                    )
+                conn.execute(
+                    "UPDATE tools SET status='available', reserved_for=NULL, retained_until=NULL WHERE tool_id=?",
+                    (rt["tool_id"],),
+                )
+                write_audit(
+                    conn, "reservation_config_update", req.operator, rt["tool_id"],
+                    detail=f"关闭预约功能，清除保留状态", success=1,
+                )
+    return {"ok": True, "config": {
+        "reservation_enabled": bool(config["reservation_enabled"]),
+        "retain_minutes": config["retain_minutes"],
+    }}
